@@ -85,6 +85,20 @@ pub struct Actor<'a, BoxedBehavior> {
     pub actorSystem: Option<&'a ActorSystem<'a>>,
 }
 
+impl<'a, B> Actor<'a, B> where B: ActorBehavior + 'static {
+    fn new(name: String, sender: Sender<MessageWrapper>, receiver: Receiver<MessageWrapper>,
+        behavior: B, actorPath: ActorPath, lastSender: Option<Sender<MessageWrapper>>, actorSystem: Option<&'a ActorSystem<'a>>) -> Actor<'a, Box<dyn ActorBehavior>> {
+        Actor{
+            name: name,
+            sender: sender,
+            receiver: receiver,
+            behavior: Box::new(behavior),
+            actorPath: actorPath,
+            lastSender: lastSender,
+            actorSystem: actorSystem}
+    }
+}
+
 impl<'a, B: ?Sized> Actor<'a, Box<B>> where B: ActorBehavior {
 
     fn getContext(&self) -> Context {
@@ -155,19 +169,19 @@ impl ActorSystem<'_> {
         Crates an actor in the thread of the actor system.
     */
     pub fn createActor<Behavior>(&mut self, name: String, behavior: Behavior)
-    where Behavior: ActorBehavior {
+    where Behavior: ActorBehavior + 'static {
         let pathStr = format!("{}/{}", self.rootPath, name);
 
         let (sender, receiver) = channel();
-        let actor = Actor{
-            name: name,
-            sender: sender,
-            receiver: receiver,
-            behavior: Box::new(behavior),
-            actorPath: ActorPath::from(&pathStr),
-            lastSender: None,
-            actorSystem: Some(self)};
-
+        // let actor = Actor{
+        //     name: name,
+        //     sender: sender,
+        //     receiver: receiver,
+        //     behavior: Box::new(behavior),
+        //     actorPath: ActorPath::from(&pathStr),
+        //     lastSender: None,
+        //     actorSystem: Some(self)};
+        let actor = Actor::new(name, sender, receiver, behavior, ActorPath::from(&pathStr), None, Some(self));
         self.pathToActorRef.insert(ActorPath(pathStr), actor.getActorRef());
         //
         self.actors.push(Box::new(actor));
