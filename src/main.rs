@@ -3,7 +3,7 @@
 
 use std::thread;
 use std::time::Duration;
-use actor_framework::actor::{ActorBehavior, ActorSystem, ActorPath, Message, Context, UserMessage, };
+use actor_framework::actor::{ActorBehavior, ActorSystem, Message, Context, UserMessage, };
 
 
 struct AutoReply{}
@@ -15,7 +15,7 @@ impl ActorBehavior for AutoReply {
             Message::User(UserMessage::StringMessage(content)) => {
                 println!("Received an message {:?}", content);
                 thread::sleep(Duration::from_secs(5));
-                context.reply(Message::User(UserMessage::StringMessage(String::from(format!("This is a message from {}", context.actorName)))));
+                context.reply(Message::User(UserMessage::StringMessage(format!("This is a message from {}", context.actorName))));
             },
             _ => (),
         };
@@ -39,10 +39,9 @@ impl ActorBehavior for AutoReply {
 
 fn main() {
     let mut actorSystem = ActorSystem::create();
-    let autoReplyBehavior = AutoReply{};
     // Creates two auto reply actor.
-    let firstActor = actorSystem.createActor(String::from("first-actor"), AutoReply{});
-    let secondActor = actorSystem.createActor(String::from("second-actor"), AutoReply{});
+    actorSystem.createActor(String::from("first-actor"), AutoReply{});
+    actorSystem.createActor(String::from("second-actor"), AutoReply{});
 
     actorSystem.start();
 }

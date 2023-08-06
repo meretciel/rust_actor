@@ -7,75 +7,21 @@ use std::thread;
 
 pub mod message;
 pub use message::{Message, UserMessage};
-
+pub mod context;
+pub use context::Context;
 pub mod actor_reference;
 pub use actor_reference::{ActorPath, ActorRef};
 pub mod internal;
-use internal::MessageWrapper;
-use std::borrow::Borrow;
+use internal::{MessageWrapper, SharedRoutingData};
 use std::thread::JoinHandle;
 
-
-type SharedRoutingData = Arc<RwLock<HashMap<ActorPath, ActorRef>>>;
-
-
-pub struct Context {
-    /// Expose the Sender type here is not a good idea.
-    pub lastSender: Option<Sender<MessageWrapper>>,
-    pub actorPath: ActorPath,
-    pub actorName: String,
-    pub routingData: SharedRoutingData,
-}
-
-impl Context {
-    pub fn getLastSender(&self) -> Option<Sender<MessageWrapper>> {
-        match &self.lastSender {
-            Some(lastSender) => Some(lastSender.clone()),
-            None => None,
-        }
-    }
-
-    pub fn getActorName(&self) -> &String {
-        return &self.actorName
-    }
-
-    pub fn resolvePathStr(&self, actorPathStr: String) -> Option<ActorRef> {
-        let lockGuard = self.routingData.read().unwrap();
-        let v = lockGuard.get(&ActorPath::from(&actorPathStr));
-        match v {
-            Some(&ref actorRef) => Some(ActorRef::clone(&actorRef)),
-            None => None,
-        }
-    }
-
-    pub fn reply(&self, message: Message) {
-        let lastSender = self.getLastSender().unwrap();
-        lastSender.send(MessageWrapper(message, self.actorPath.clone()))
-            .expect("Failed to send message.");
-    }
-
-    // pub fn sendMsg(&self, message: Message, actorPath: &ActorPath) {
-    //     let lockGuard = self.routingData.read().unwrap();
-    //     let v = lockGuard.get(actorPath);
-    //     if let Some(&ref actorRef) = v {
-    //         actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()))
-    //             .expect("Failed to send message.");
-    //     }
-    // }
-
-    pub fn sendMsg(&self, message: Message, actorRef: &ActorRef) -> Option<()> {
-        println!("sending an message from {}", self.actorName);
-        let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
-        Some(())
-    }
-}
-
-
-
+/// Trait that represents the actor behavior.
+///
+/// Note that this trait acquires that the Send trait is implemented because we need to send
+/// the behavior object to a separate thread.
 pub trait ActorBehavior: Send {
-    /**
-       Method that is invoked when the actor receives a message.
-    */
+
+    /// Method that is invoked when the actor receives a message.
     fn onReceive(&self, message: &Message, context: &Context);
 
     /// Method that is invoked when automatically after the actor is constructed.
@@ -101,7 +47,7 @@ pub struct ActorInner<BoxedBehavior> {
 }
 
 
-impl<B> ActorInner<Box<B>> where B: ?Sized + ActorBehavior + Send {
+impl<B> ActorInner<Box<B>> where B: ?Sized + ActorBehavior {
     fn getContext(&self, lastSender: Option<&Sender<MessageWrapper>>) -> Context {
         match lastSender {
             Some(lastSender) => Context{
@@ -120,15 +66,29 @@ impl<B> ActorInner<Box<B>> where B: ?Sized + ActorBehavior + Send {
         }
     }
 }
+/// Marks it's unsafe to send and share the ActorInner.
+/// The cause of the issue is that in the ActorInner, we have the Sender<MessageWrapper> field.
+/// Sharing the Sender in multiple threads is not safe. In our implementation, we are ok because
+/// Once we move the ActorInner to the thread, we don't access it from the outside anymore.
+/// However, the previous statement will not be verified by the compiler due to the following code
+/// block.
+unsafe impl<B> Send for ActorInner<B> {}
+unsafe impl<B> Sync for ActorInner<B> {}
 
+
+/// This is the actor class.
+///
+/// This is a thin wrapper of the ActorInner struct. It's needed because in the current implementation
+/// we start the new thread within the Actor struct and the thread could out live the Actor object.
+/// This makes sense, because the ActorInner instance is shared by the actor thread and the Actor
+/// instance in the main thread.
 pub struct Actor<BoxedBehavior> {
     inner: Arc<Mutex<ActorInner<BoxedBehavior>>>
 }
 
-unsafe impl<B> Send for ActorInner<B> {}
-unsafe impl<B> Sync for ActorInner<B> {}
-
-impl<B> Actor<B> where B: ActorBehavior + Send + 'static {
+impl<B> Actor<B> where B: ActorBehavior + 'static {
+    /// This method is needed to explicitly specify the class.
+    /// The problem we had is related to B and Box<B>.
     fn new(name: String, sender: Sender<MessageWrapper>, receiver: Receiver<MessageWrapper>,
         behavior: B, actorPath: ActorPath, lastSender: Option<Sender<MessageWrapper>>, routingData: SharedRoutingData) -> Actor<Box<dyn ActorBehavior>> {
         let inner: ActorInner<Box<dyn ActorBehavior>> = ActorInner{
@@ -144,36 +104,24 @@ impl<B> Actor<B> where B: ActorBehavior + Send + 'static {
     }
 }
 
-impl<B> Actor<Box<B>> where B: ?Sized + ActorBehavior + Send + 'static {
 
-    // fn getContext(&self) -> Context {
-    //     let inner = self.inner.lock().unwrap();
-    //
-    //     match &inner.lastSender {
-    //         Some(lastSender) => Context{
-    //             lastSender: Some(lastSender.clone()),
-    //             actorPath: inner.actorPath.clone(),
-    //             actorName: inner.name.clone(),
-    //             routingData: Arc::clone(&inner.routingData),
-    //         },
-    //
-    //         None => Context{
-    //             lastSender: None,
-    //             actorPath: inner.actorPath.clone(),
-    //             actorName: inner.name.clone(),
-    //             routingData: Arc::clone(&inner.routingData),
-    //         },
-    //     }
-    // }
-
+/// The implementation of the Actor struct.
+///     ?Sized: Here we have a dynamic behavior so the size of the Behavior cannot be determined
+///             during compile time.
+///     ActorBehavior: The type B needs to be a ActorBehavior.
+///     'static: TODO: Note quire sure on this one. It seems it means the object that implements
+///                    the trait only contains static reference. To some extent, this makes sense,
+///                    because the behavior is just funtion and it should be static. We cannot have
+///                    a function that can become invalid in the middle of the program execution.
+impl<B> Actor<Box<B>> where B: ?Sized + ActorBehavior + 'static {
     /// Run the actor.
     /// The actor process received messages in this function.
     fn run(&self) -> JoinHandle<()> {
-        let mut clonedSelf = self.inner.clone();
+        let clonedSelf = self.inner.clone();
         return thread::spawn(move || {
             println!("The actor start to run.");
             loop {
-                let mut inner = clonedSelf.lock().unwrap();
+                let inner = clonedSelf.lock().unwrap();
                 println!("actor {} is in the loop", inner.name);
                 let msg = inner.receiver.recv().unwrap();
                 let message = msg.0;
@@ -181,8 +129,7 @@ impl<B> Actor<Box<B>> where B: ?Sized + ActorBehavior + Send + 'static {
                 let lg = inner.routingData.read().unwrap();
                 let senderActorRefOp = lg.get(&senderActorPath);
                 match senderActorRefOp {
-                    Some(&ref senderActorRef) => {
-                        // inner.lastSender = Some(senderActorRef.sender.clone());
+                    Some(senderActorRef) => {
                         let context = inner.getContext(Some(&senderActorRef.sender));
                         inner.behavior.onReceive(&message, &context);
                     },
@@ -200,24 +147,14 @@ impl<B> Actor<Box<B>> where B: ?Sized + ActorBehavior + Send + 'static {
         inner.behavior.start(&context);
     }
 
-    // fn sendMsgToActorPath(&self, message: Message, actorPath: &ActorPath) -> Option<()> {
-    //     let lockGuard = self.routingData.read().unwrap();
-    //     let actorRef = lockGuard.get(actorPath)?;
-    //     let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
-    //     Some(())
-    // }
-    //
-    // fn sendMsgToActorRef(&self, message: Message, actorRef: &ActorRef) -> Option<()> {
-    //     let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
-    //     Some(())
-    // }
-    //
     pub fn getActorRef(&self) -> ActorRef {
         let inner = self.inner.lock().unwrap();
         return ActorRef{ sender: inner.sender.clone() };
     }
 }
 
+/// Struct the represents the actor system.
+/// The actor system tracks the shared data used by actors.
 pub struct ActorSystem{
     rootPath: String,
     pathToActorRef: SharedRoutingData,
@@ -245,11 +182,10 @@ impl ActorSystem {
         }
     }
 
-    /**
-        Crates an actor in the thread of the actor system.
-    */
+    /// Crates an actor in the thread of the actor system.
+    /// Actor will be moved to a dedicated thread when the actor system starts them.
     pub fn createActor<Behavior>(&mut self, name: String, behavior: Behavior)
-    where Behavior: ActorBehavior + 'static + Send {
+    where Behavior: ActorBehavior + 'static {
         let pathStr = format!("/{}", name);
         println!("Create actor {} with path {}", name, pathStr);
 
@@ -262,9 +198,4 @@ impl ActorSystem {
         println!("routing data main: {}", underlyingData.len());
     }
 }
-
-
-
-
-
 
