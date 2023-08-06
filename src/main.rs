@@ -11,6 +11,7 @@ struct AutoReply{}
 impl ActorBehavior for AutoReply {
 
     fn onReceive(&self, message: &Message, context: &Context) {
+        println!("received a message {:?}.", message);
         match message {
             Message::User(UserMessage::StringMessage(content)) => {
                 println!("Received an message {:?}", content);
@@ -22,11 +23,16 @@ impl ActorBehavior for AutoReply {
     }
 
     fn start(&self, context: &Context) {
-        if (context.getActorName() == "first-actor") {
-            let destRef = context.resolvePathStr(String::from("second-actor"));
+        let v = context.routingData.read().unwrap();
+
+        println!("Actor {} starts, size: {}.", context.actorName, v.len());
+
+        if (context.getActorName() == "second-actor") {
+            let destRef = context.resolvePathStr(String::from("/first-actor"));
+            println!("destRef is {:?}", destRef);
             if let Some(actorRef) = destRef {
                 context.sendMsg(Message::User(UserMessage::StringMessage(String::from("hello from actor i1"))),
-                                              &ActorPath::from("/second-actor"));
+                                              &actorRef);
             }
         }
     }
@@ -37,8 +43,8 @@ fn main() {
     let mut actorSystem = ActorSystem::create();
     let autoReplyBehavior = AutoReply{};
     // Creates two auto reply actor.
-    let firstActor = actorSystem.createActor(String::from("first-actor"), Box::new(AutoReply{}));
-    let secondActor = actorSystem.createActor(String::from("second-actor"), Box::new(AutoReply{}));
+    let firstActor = actorSystem.createActor(String::from("first-actor"), AutoReply{});
+    let secondActor = actorSystem.createActor(String::from("second-actor"), AutoReply{});
 
     actorSystem.start();
 }

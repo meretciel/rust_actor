@@ -1,8 +1,15 @@
 use std::sync::mpsc::Sender;
 use super::internal::MessageWrapper;
 
+#[derive(Debug)]
 pub struct ActorRef {
     pub sender: Sender<MessageWrapper>
+}
+
+impl ActorRef {
+    pub fn clone(other: &ActorRef) -> ActorRef {
+        ActorRef{sender: other.sender.clone()}
+    }
 }
 
 #[derive(Clone)]
