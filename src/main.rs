@@ -11,12 +11,11 @@ struct AutoReply{}
 impl ActorBehavior for AutoReply {
 
     fn onReceive(&self, message: &Message, context: &Context) {
-        println!("received a message {:?}.", message);
         match message {
             Message::User(UserMessage::StringMessage(content)) => {
                 println!("Received an message {:?}", content);
                 thread::sleep(Duration::from_secs(5));
-                context.reply(Message::User(UserMessage::StringMessage(String::from("hello from actor i1"))));
+                context.reply(Message::User(UserMessage::StringMessage(String::from(format!("This is a message from {}", context.actorName)))));
             },
             _ => (),
         };
@@ -31,13 +30,12 @@ impl ActorBehavior for AutoReply {
             let destRef = context.resolvePathStr(String::from("/first-actor"));
             println!("destRef is {:?}", destRef);
             if let Some(actorRef) = destRef {
-                context.sendMsg(Message::User(UserMessage::StringMessage(String::from("hello from actor i1"))),
+                context.sendMsg(Message::User(UserMessage::StringMessage(String::from("hello from the second actor"))),
                                               &actorRef);
             }
         }
     }
 }
-
 
 fn main() {
     let mut actorSystem = ActorSystem::create();

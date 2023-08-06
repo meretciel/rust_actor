@@ -1,10 +1,9 @@
 #![allow(non_snake_case)]
 #![allow(unused_parens)]
-use std::borrow::Borrow;
-
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 
 pub mod message;
 pub use message::{Message, UserMessage};
@@ -13,22 +12,24 @@ pub mod actor_reference;
 pub use actor_reference::{ActorPath, ActorRef};
 pub mod internal;
 use internal::MessageWrapper;
+use std::borrow::Borrow;
+use std::thread::JoinHandle;
 
 
 type SharedRoutingData = Arc<RwLock<HashMap<ActorPath, ActorRef>>>;
 
 
-pub struct Context<'a> {
+pub struct Context {
     /// Expose the Sender type here is not a good idea.
-    pub lastSender: Option<&'a Sender<MessageWrapper>>,
-    pub actorPath: &'a ActorPath,
+    pub lastSender: Option<Sender<MessageWrapper>>,
+    pub actorPath: ActorPath,
     pub actorName: String,
     pub routingData: SharedRoutingData,
 }
 
-impl<'a> Context<'a> {
+impl Context {
     pub fn getLastSender(&self) -> Option<Sender<MessageWrapper>> {
-        match self.lastSender {
+        match &self.lastSender {
             Some(lastSender) => Some(lastSender.clone()),
             None => None,
         }
@@ -71,7 +72,7 @@ impl<'a> Context<'a> {
 
 
 
-pub trait ActorBehavior {
+pub trait ActorBehavior: Send {
     /**
        Method that is invoked when the actor receives a message.
     */
@@ -82,9 +83,7 @@ pub trait ActorBehavior {
 }
 
 
-
-
-pub struct Actor<BoxedBehavior> {
+pub struct ActorInner<BoxedBehavior> {
     /// The name of the actor.
     pub name: String,
     /// The sender that can send message to this actor.
@@ -101,64 +100,123 @@ pub struct Actor<BoxedBehavior> {
     pub routingData: SharedRoutingData,
 }
 
-impl<B> Actor<B> where B: ActorBehavior + 'static {
-    fn new(name: String, sender: Sender<MessageWrapper>, receiver: Receiver<MessageWrapper>,
-        behavior: B, actorPath: ActorPath, lastSender: Option<Sender<MessageWrapper>>, routingData: SharedRoutingData) -> Actor<Box<dyn ActorBehavior>> {
-        Actor{
-            name: name,
-            sender: sender,
-            receiver: receiver,
-            behavior: Box::new(behavior),
-            actorPath: actorPath,
-            lastSender: lastSender,
-            routingData: routingData}
-    }
-}
 
-impl<B: ?Sized> Actor<Box<B>> where B: ActorBehavior {
-
-    fn getContext(&self) -> Context {
-        match &self.lastSender {
+impl<B> ActorInner<Box<B>> where B: ?Sized + ActorBehavior + Send {
+    fn getContext(&self, lastSender: Option<&Sender<MessageWrapper>>) -> Context {
+        match lastSender {
             Some(lastSender) => Context{
-                lastSender: Some(lastSender),
-                actorPath: &self.actorPath,
+                lastSender: Some(lastSender.clone()),
+                actorPath: self.actorPath.clone(),
                 actorName: self.name.clone(),
                 routingData: Arc::clone(&self.routingData),
             },
 
             None => Context{
                 lastSender: None,
-                actorPath: &self.actorPath,
+                actorPath: self.actorPath.clone(),
                 actorName: self.name.clone(),
                 routingData: Arc::clone(&self.routingData),
             },
         }
     }
+}
 
-    pub fn start(&self) {
-        let context = self.getContext();
-        self.behavior.start(&context);
-    }
+pub struct Actor<BoxedBehavior> {
+    inner: Arc<Mutex<ActorInner<BoxedBehavior>>>
+}
 
-    fn sendMsgToActorPath(&self, message: Message, actorPath: &ActorPath) -> Option<()> {
-        let lockGuard = self.routingData.read().unwrap();
-        let actorRef = lockGuard.get(actorPath)?;
-        let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
-        Some(())
-    }
+unsafe impl<B> Send for ActorInner<B> {}
+unsafe impl<B> Sync for ActorInner<B> {}
 
-    fn sendMsgToActorRef(&self, message: Message, actorRef: &ActorRef) -> Option<()> {
-        let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
-        Some(())
-    }
+impl<B> Actor<B> where B: ActorBehavior + Send + 'static {
+    fn new(name: String, sender: Sender<MessageWrapper>, receiver: Receiver<MessageWrapper>,
+        behavior: B, actorPath: ActorPath, lastSender: Option<Sender<MessageWrapper>>, routingData: SharedRoutingData) -> Actor<Box<dyn ActorBehavior>> {
+        let inner: ActorInner<Box<dyn ActorBehavior>> = ActorInner{
+            name: name,
+            sender: sender,
+            receiver: receiver,
+            behavior: Box::new(behavior),
+            actorPath: actorPath,
+            lastSender: lastSender,
+            routingData: routingData};
 
-    pub fn getActorRef(&self) -> ActorRef {
-        return ActorRef{ sender: self.sender.clone() };
+        Actor{inner: Arc::new(Mutex::new(inner))}
     }
 }
 
+impl<B> Actor<Box<B>> where B: ?Sized + ActorBehavior + Send + 'static {
 
+    // fn getContext(&self) -> Context {
+    //     let inner = self.inner.lock().unwrap();
+    //
+    //     match &inner.lastSender {
+    //         Some(lastSender) => Context{
+    //             lastSender: Some(lastSender.clone()),
+    //             actorPath: inner.actorPath.clone(),
+    //             actorName: inner.name.clone(),
+    //             routingData: Arc::clone(&inner.routingData),
+    //         },
+    //
+    //         None => Context{
+    //             lastSender: None,
+    //             actorPath: inner.actorPath.clone(),
+    //             actorName: inner.name.clone(),
+    //             routingData: Arc::clone(&inner.routingData),
+    //         },
+    //     }
+    // }
 
+    /// Run the actor.
+    /// The actor process received messages in this function.
+    fn run(&self) -> JoinHandle<()> {
+        let mut clonedSelf = self.inner.clone();
+        return thread::spawn(move || {
+            println!("The actor start to run.");
+            loop {
+                let mut inner = clonedSelf.lock().unwrap();
+                println!("actor {} is in the loop", inner.name);
+                let msg = inner.receiver.recv().unwrap();
+                let message = msg.0;
+                let senderActorPath = msg.1;
+                let lg = inner.routingData.read().unwrap();
+                let senderActorRefOp = lg.get(&senderActorPath);
+                match senderActorRefOp {
+                    Some(&ref senderActorRef) => {
+                        // inner.lastSender = Some(senderActorRef.sender.clone());
+                        let context = inner.getContext(Some(&senderActorRef.sender));
+                        inner.behavior.onReceive(&message, &context);
+                    },
+                    None => println!("Unknown sender."),
+                }
+            }
+        });
+    }
+
+    /// Starts the actor in a separate thread.
+    /// In the current implementation, each actor has its own thread..
+    pub fn start(&self) {
+        let inner = self.inner.lock().unwrap();
+        let context = inner.getContext(None);
+        inner.behavior.start(&context);
+    }
+
+    // fn sendMsgToActorPath(&self, message: Message, actorPath: &ActorPath) -> Option<()> {
+    //     let lockGuard = self.routingData.read().unwrap();
+    //     let actorRef = lockGuard.get(actorPath)?;
+    //     let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
+    //     Some(())
+    // }
+    //
+    // fn sendMsgToActorRef(&self, message: Message, actorRef: &ActorRef) -> Option<()> {
+    //     let _ = actorRef.sender.send(MessageWrapper(message, self.actorPath.clone()));
+    //     Some(())
+    // }
+    //
+    pub fn getActorRef(&self) -> ActorRef {
+        let inner = self.inner.lock().unwrap();
+        return ActorRef{ sender: inner.sender.clone() };
+    }
+}
 
 pub struct ActorSystem{
     rootPath: String,
@@ -176,8 +234,14 @@ impl ActorSystem {
     }
 
     pub fn start(&self) {
+        let mut joinHandles = vec![];
         for actor in self.actors.iter() {
             actor.start();
+            joinHandles.push(actor.run());
+        }
+
+        for item in joinHandles {
+            item.join().expect("Thread failed.");
         }
     }
 
@@ -185,7 +249,7 @@ impl ActorSystem {
         Crates an actor in the thread of the actor system.
     */
     pub fn createActor<Behavior>(&mut self, name: String, behavior: Behavior)
-    where Behavior: ActorBehavior + 'static {
+    where Behavior: ActorBehavior + 'static + Send {
         let pathStr = format!("/{}", name);
         println!("Create actor {} with path {}", name, pathStr);
 
@@ -196,9 +260,6 @@ impl ActorSystem {
         //
         self.actors.push(Box::new(actor));
         println!("routing data main: {}", underlyingData.len());
-        // let v = self.actors.get(0).unwrap().routingData.read().unwrap();
-        // let v = v.len();
-        // println!("routing data actor: {}", v);
     }
 }
 
